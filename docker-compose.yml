@@ -1,0 +1,22 @@
+services:
+  jellyseerr-matrix-request-bot:
+    build: .
+    container_name: jellyseerr-matrix-request-bot
+    restart: unless-stopped
+    env_file: config.env
+    volumes:
+      # The crypto store MUST persist, otherwise the bot shows up as a new
+      # Matrix device on every restart and old messages become undecryptable.
+      - store:/data/store
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/healthz')"]
+      interval: 60s
+      timeout: 5s
+      retries: 3
+    # The bot listens on container port 8080 (/metrics and /healthz only - it
+    # has no inbound webhook, all traffic to Jellyseerr/OpenAI is outbound).
+    # ports:
+    #   - "8080:8080"
+
+volumes:
+  store:

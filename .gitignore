@@ -1,0 +1,4 @@
+__pycache__/
+store/
+config.env
+.venv/

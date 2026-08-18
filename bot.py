@@ -559,7 +559,9 @@ async def main():
 
     async def show_result(session: Session, target_event_id: str | None = None):
         """Render the current result and either send a new message (with
-        reactions) or edit the existing one."""
+        reactions) or edit the existing one. Returns the event_id of the
+        message that carries the result (the new one on first send, the target
+        on edit) so the caller can key its session on it."""
         result = session.results[session.index]
         body, formatted = render_result(result, session.index + 1, len(session.results))
         if target_event_id is None:
@@ -567,8 +569,9 @@ async def main():
             if resp is not None:
                 for key in (REACT_PREV, REACT_REQUEST, REACT_NEXT):
                     await send_reaction(client, room_id, resp.event_id, key)
-        else:
-            await edit_message(client, room_id, target_event_id, body, formatted, result.get("poster_url"))
+            return resp.event_id if resp is not None else None
+        await edit_message(client, room_id, target_event_id, body, formatted, result.get("poster_url"))
+        return target_event_id
 
     async def handle_command(sender: str, query: str):
         if not query:
@@ -588,8 +591,13 @@ async def main():
             return
 
         session = Session(query=query, results=results, index=0, page=1)
-        session_set(sessions, "pending", session, time.monotonic(), session_ttl)
-        await show_result(session)
+        # Key the session on the event_id of the result message we are about to
+        # send: reactions on that message arrive with that event_id, and
+        # handle_reaction looks the session up by it. (Storing under a fixed
+        # "pending" key would make every reaction look up a missing session.)
+        event_id = await show_result(session)
+        if event_id is not None:
+            session_set(sessions, event_id, session, time.monotonic(), session_ttl)
         REQUESTS.labels("ok").inc()
 
     async def handle_reaction(sender: str, target_event_id: str, key: str):

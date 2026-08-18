@@ -3,7 +3,20 @@ services:
     build: .
     container_name: jellyseerr-matrix-request-bot
     restart: unless-stopped
-    env_file: config.env
+    environment:
+      MATRIX_URL: ${MATRIX_URL}
+      MATRIX_USER_ID: ${MATRIX_USER_ID}
+      MATRIX_TOKEN: ${MATRIX_TOKEN}
+      MATRIX_DEVICE_ID: ${MATRIX_DEVICE_ID}
+      MATRIX_ROOM_ID: ${MATRIX_ROOM_ID}
+      JELLYSEERR_API_URL: ${JELLYSEERR_API_URL}
+      JELLYSEERR_API_KEY: ${JELLYSEERR_API_KEY}
+      JELLYSEERR_URL: ${JELLYSEERR_URL}
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4.1-nano}
+      REQUEST_TRIGGER_PREFIX: ${REQUEST_TRIGGER_PREFIX:-!request}
+      REQUEST_CONFIRM_TIMEOUT_SECONDS: ${REQUEST_CONFIRM_TIMEOUT_SECONDS:-300}
+      BOT_LANG: ${BOT_LANG:-en}
     volumes:
       # The crypto store MUST persist, otherwise the bot shows up as a new
       # Matrix device on every restart and old messages become undecryptable.

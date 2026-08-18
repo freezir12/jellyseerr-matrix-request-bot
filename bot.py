@@ -20,6 +20,7 @@ import re
 import sys
 import time
 from dataclasses import dataclass, field
+from urllib.parse import quote
 from uuid import uuid4
 
 import aiohttp
@@ -289,10 +290,16 @@ def _status_from_media_info(media_info: dict | None) -> str:
 async def search_jellyseerr(query: str, page: int = 1) -> list[dict]:
     """Search Jellyseerr for movies/TV shows. Returns a list of result dicts
     (title, overview, release_date, poster_url, media_type, media_id, status),
-    filtering out 'person' results like teleseerr does."""
+    filtering out 'person' results like teleseerr does.
+
+    The query is URL-encoded TWICE: Jellyseerr rejects a raw multi-word query
+    ("The Lion King" -> 400 'must be url encoded'), and aiohttp encodes the
+    params dict once more on the wire. teleseerr does the same via
+    `searchParams.append(key, encodeURIComponent(val))` - the double encoding
+    is what Jellyseerr actually expects."""
     url = f"{JELLYSEERR_API_URL}/search"
     headers = {"X-Api-Key": JELLYSEERR_API_KEY, "Content-Type": "application/json"}
-    params = {"query": query, "page": str(page)}
+    params = {"query": quote(query), "page": str(page)}
     async with aiohttp.ClientSession() as session:
         async with session.get(url, headers=headers, params=params) as resp:
             if resp.status >= 400:

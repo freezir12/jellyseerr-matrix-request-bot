@@ -11,6 +11,7 @@ navigate through results, load more (pagination), or fire the request.
 Search goes straight to the Jellyseerr API (no LLM), exactly like teleseerr.
 """
 import asyncio
+import hmac
 import html
 import io
 import json
@@ -46,6 +47,8 @@ log = logging.getLogger("jellyseerr-matrix-request-bot")
 ERRORS = Counter("bot_errors_total", "Errors (log.error/log.exception) anywhere in the bot")
 REQUESTS = Counter("bot_requests_total", "!request commands handled", ["outcome"])
 NAVIGATION = Counter("bot_navigation_total", "Reaction navigation events", ["action"])
+WEBHOOKS = Counter("bot_webhooks_total", "Incoming webhook requests", ["status"])
+NOTIFICATIONS = Counter("bot_notifications_total", "Notifications sent to Matrix", ["type"])
 LAST_SYNC = Gauge("bot_last_sync_timestamp", "Unix time of the last /sync from the homeserver")
 
 IMAGE_TMDB_URL = "https://image.tmdb.org/t/p/w600_and_h900_bestv2"
@@ -85,6 +88,39 @@ STRINGS = {
         "no_more_prev": "You cannot go back more!",
         "no_more_next": "No more results.",
         "media_type": {"movie": "Movie", "tv": "TV Show"},
+        # --- Notifier strings (webhook -> Matrix notifications) ---
+        "events": {
+            "TEST_NOTIFICATION": "Test notification",
+            "MEDIA_PENDING": "New request – waiting for approval",
+            "MEDIA_APPROVED": "Request approved",
+            "MEDIA_AUTO_APPROVED": "Request auto-approved",
+            "MEDIA_DECLINED": "Request declined",
+            "MEDIA_AVAILABLE": "Now available",
+            "ISSUE_CREATED": "New issue reported",
+            "ISSUE_COMMENT": "New comment on issue",
+            "ISSUE_RESOLVED": "Issue resolved",
+            "ISSUE_REOPENED": "Issue reopened",
+        },
+        "media_types": {"movie": "Movie", "tv": "Series"},
+        "status": {
+            "PENDING": "Pending",
+            "PROCESSING": "Processing",
+            "PARTIALLY_AVAILABLE": "Partially available",
+            "AVAILABLE": "Available",
+        },
+        "issue_types": {"VIDEO": "Video", "AUDIO": "Audio", "SUBTITLES": "Subtitles",
+                        "OTHER": "Other"},
+        "issue_status": {"OPEN": "Open", "RESOLVED": "Resolved"},
+        "untitled": "(untitled)",
+        "status_label": "Status",
+        "seasons": "Seasons",
+        "season": "Season",
+        "episode": "Episode",
+        "comment_by": "Comment by",
+        "requested_by": "Requested by",
+        "reported_by": "Reported by",
+        "reply": "Reply",
+        "reopen": "Reopen",
     },
     "de": {
         "usage": "Nutzung: !request <Titel>",
@@ -100,6 +136,39 @@ STRINGS = {
         "no_more_prev": "Du kannst nicht weiter zurück!",
         "no_more_next": "Keine weiteren Ergebnisse.",
         "media_type": {"movie": "Film", "tv": "Serie"},
+        # --- Notifier strings (webhook -> Matrix notifications) ---
+        "events": {
+            "TEST_NOTIFICATION": "Test-Benachrichtigung",
+            "MEDIA_PENDING": "Neue Anfrage – wartet auf Freigabe",
+            "MEDIA_APPROVED": "Anfrage genehmigt",
+            "MEDIA_AUTO_APPROVED": "Anfrage automatisch genehmigt",
+            "MEDIA_DECLINED": "Anfrage abgelehnt",
+            "MEDIA_AVAILABLE": "Jetzt verfügbar",
+            "ISSUE_CREATED": "Neues Problem gemeldet",
+            "ISSUE_COMMENT": "Neuer Kommentar zum Problem",
+            "ISSUE_RESOLVED": "Problem gelöst",
+            "ISSUE_REOPENED": "Problem wieder geöffnet",
+        },
+        "media_types": {"movie": "Film", "tv": "Serie"},
+        "status": {
+            "PENDING": "Ausstehend",
+            "PROCESSING": "In Bearbeitung",
+            "PARTIALLY_AVAILABLE": "Teilweise verfügbar",
+            "AVAILABLE": "Verfügbar",
+        },
+        "issue_types": {"VIDEO": "Video", "AUDIO": "Ton", "SUBTITLES": "Untertitel",
+                        "OTHER": "Sonstiges"},
+        "issue_status": {"OPEN": "Offen", "RESOLVED": "Gelöst"},
+        "untitled": "(ohne Titel)",
+        "status_label": "Status",
+        "seasons": "Staffeln",
+        "season": "Staffel",
+        "episode": "Episode",
+        "comment_by": "Kommentar von",
+        "requested_by": "Angefragt von",
+        "reported_by": "Gemeldet von",
+        "reply": "Antworten",
+        "reopen": "Wieder öffnen",
     },
 }
 
@@ -112,6 +181,196 @@ def set_lang(code: str):
         log.warning("Unknown BOT_LANG %r, falling back to en", code)
         code = "en"
     S = STRINGS[code]
+
+
+# --- Notifier: webhook -> Matrix notifications ------------------------------
+# Ported from jellyseerr-matrix-bot/bot.py. This bot now also listens for
+# Jellyseerr webhooks and posts notifications, so it is a single process that
+# both notifies (webhook in) and lets users search/request (!request out).
+
+# Emoji per Jellyseerr notification_type. Types not listed here (e.g. *_FAILED)
+# are dropped. Headlines live in STRINGS, keyed by the same names.
+EMOJI = {
+    "TEST_NOTIFICATION": "🔔",
+    "MEDIA_PENDING": "📥",
+    "MEDIA_APPROVED": "✅",
+    "MEDIA_AUTO_APPROVED": "✅",
+    "MEDIA_DECLINED": "❌",
+    "MEDIA_AVAILABLE": "🎬",
+    "ISSUE_CREATED": "⚠️",
+    "ISSUE_COMMENT": "💬",
+    "ISSUE_RESOLVED": "✔️",
+    "ISSUE_REOPENED": "🔁",
+}
+
+# Events where the affected user themselves gets pinged. MEDIA_AUTO_APPROVED is
+# deliberately absent: MEDIA_AVAILABLE follows shortly after and pings anyway.
+PING_EVENTS = {
+    "MEDIA_APPROVED",
+    "MEDIA_DECLINED",
+    "MEDIA_AVAILABLE",
+    "ISSUE_COMMENT",
+    "ISSUE_RESOLVED",
+    "ISSUE_REOPENED",
+}
+
+# Events where the operator team (ADMIN_IDS) is pinged as well: nobody should
+# miss a new request / new issue. ISSUE_REOPENED carries no actor in the
+# payload -> ping both sides.
+ADMIN_PING_EVENTS = {"MEDIA_PENDING", "ISSUE_CREATED", "ISSUE_REOPENED"}
+
+# Issue follow-ups: no poster (the card for ISSUE_CREATED already showed it) and
+# candidates for the close/reopen-with-comment merge (Jellyseerr fires two
+# webhooks for that single action).
+ISSUE_FOLLOWUPS = {"ISSUE_COMMENT", "ISSUE_RESOLVED", "ISSUE_REOPENED"}
+MERGE_WINDOW = 5  # seconds to wait for the second webhook of a close-with-comment
+
+# Jellyseerr fires the same MEDIA_* notification multiple times in ONE
+# availability/recently-added scan. We drop repeats of the same (type, item)
+# within a short window.
+DEDUP_EVENTS = {
+    "MEDIA_PENDING", "MEDIA_APPROVED", "MEDIA_AUTO_APPROVED",
+    "MEDIA_DECLINED", "MEDIA_AVAILABLE",
+}
+DEDUP_TTL = 60  # seconds
+
+
+def render(
+    payload: dict, user_map: dict, admin_ids: list[str] = (), jellyseerr_url: str = ""
+) -> tuple[str, str, list[str]] | None:
+    """-> (body, formatted_body, mention_ids), or None if this type is not sent."""
+    ntype = payload.get("notification_type") or ""
+    if ntype not in EMOJI:
+        return None
+    emoji, headline = EMOJI[ntype], S["events"][ntype]
+
+    media = payload.get("media") or {}
+    request = payload.get("request") or {}
+    issue = payload.get("issue") or {}
+    comment = payload.get("comment") or {}
+
+    subject = payload.get("subject") or S["untitled"]
+    message = payload.get("message") or ""
+    kind = S["media_types"].get(media.get("media_type") or "", media.get("media_type") or "")
+
+    # The affected user: the reporter for issue events, the requester otherwise.
+    target = payload.get("notifyuser_username") or (
+        issue.get("reportedBy_username") if issue else request.get("requestedBy_username")
+    )
+
+    lines, html_lines, mentions = [], [], []
+    lines.append(f"{emoji} {headline}")
+    html_lines.append(f"<b>{html.escape(emoji + ' ' + headline)}</b>")
+
+    title = f"{subject} ({kind})" if kind else subject
+    lines.append(title)
+    title_html = f"<b>{html.escape(subject)}</b>" + (f" ({html.escape(kind)})" if kind else "")
+    mtype = media.get("media_type")
+    tmdb = media.get("tmdbId")
+    if jellyseerr_url and tmdb and mtype in ("movie", "tv"):
+        href = f"{jellyseerr_url.rstrip('/')}/{mtype}/{tmdb}"
+        title_html = f'<a href="{html.escape(href)}">{title_html}</a>'
+    html_lines.append(title_html)
+
+    def extra(name):
+        return next(
+            (e.get("value") for e in (payload.get("extra") or []) if e.get("name") == name), None
+        )
+
+    parts = []
+    status = S["status"].get(media.get("status") or "")
+    if status:
+        parts.append(f"{S['status_label']}: {status}")
+    seasons = extra("Requested Seasons")
+    if seasons:
+        parts.append(f"{S['seasons']}: {seasons}")
+    if parts:
+        meta = " · ".join(parts)
+        lines.append(meta)
+        html_lines.append(f'<font color="#9e9e9e">{html.escape(meta)}</font>')
+
+    if issue.get("issue_type"):
+        t = issue["issue_type"]
+        detail = S["issue_types"].get(str(t).upper(), t)
+        s = issue.get("issue_status")
+        if s:
+            detail += f" · {S['issue_status'].get(str(s).upper(), s)}"
+        season, episode = extra("Affected Season"), extra("Affected Episode")
+        if season:
+            detail += f" · {S['season']} {season}" + (f", {S['episode']} {episode}" if episode else "")
+        lines.append(detail)
+        html_lines.append(f'<font color="#9e9e9e">{html.escape(detail)}</font>')
+
+    body_text = comment.get("comment_message") or message
+    if body_text:
+        lines.append(body_text)
+        html_lines.append("")
+        html_lines.append(f"<em>{html.escape(body_text)}</em>")
+
+    def name_html(username: str) -> str:
+        mxid = user_map.get(username)
+        if not mxid:
+            log.warning("No USER_MAP entry for Jellyseerr user %r", username)
+            return html.escape(username)
+        return f'<a href="https://matrix.to/#/{html.escape(mxid)}">{html.escape(username)}</a>'
+
+    footer = []
+
+    author = comment.get("commentedBy_username")
+    if author:
+        lines.append(f"{S['comment_by']}: {author}")
+        footer.append(f"{S['comment_by']} {name_html(author)}")
+
+    if target:
+        label = S["reported_by"] if issue else S["requested_by"]
+        lines.append(f"{label}: {target}")
+        footer.append(f"{label} {name_html(target)}")
+        mxid = user_map.get(target)
+        if mxid and ntype in PING_EVENTS:
+            mentions.append(mxid)
+
+    if jellyseerr_url and issue.get("issue_id"):
+        href = f"{jellyseerr_url.rstrip('/')}/issues/{issue['issue_id']}"
+        icon, label = ("🔁", S["reopen"]) if ntype == "ISSUE_RESOLVED" else ("💬", S["reply"])
+        lines.append(f"{label}: {href}")
+        footer.append(f'{icon} <a href="{html.escape(href)}">{label}</a>')
+
+    admin_ping = ntype in ADMIN_PING_EVENTS or (author and author == target)
+    if admin_ping and admin_ids:
+        mentions.extend(admin_ids)
+        lines.append("cc: " + " ".join(admin_ids))
+        footer.append(
+            "cc: "
+            + " ".join(
+                f'<a href="https://matrix.to/#/{html.escape(i)}">{html.escape(i)}</a>'
+                for i in admin_ids
+            )
+        )
+
+    if footer:
+        html_lines.append("")
+        html_lines.extend(footer)
+
+    author_mxid = user_map.get(author) if author else None
+    mentions = [m for m in dict.fromkeys(mentions) if m != author_mxid]
+    return "\n".join(lines), "<br>".join(html_lines), mentions
+
+
+def dedup_seen(recent: dict, ntype: str, payload: dict, now: float, ttl: int = DEDUP_TTL) -> bool:
+    """True if (ntype, item) was already seen within `ttl` - a Jellyseerr burst
+    duplicate to drop. Otherwise records it and returns False."""
+    if ntype not in DEDUP_EVENTS:
+        return False
+    media = payload.get("media") or {}
+    ident = str(media.get("tmdbId") or "") or (payload.get("subject") or "")
+    key = (ntype, ident)
+    for k, exp in list(recent.items()):
+        if exp <= now:
+            del recent[k]
+    if key in recent:
+        return True
+    recent[key] = now + ttl
+    return False
 
 
 # --- Matrix E2EE send path -------------------------------------------------
@@ -476,6 +735,10 @@ async def main():
         REQUESTS.labels(outcome)
     for action in ("prev", "request", "next"):
         NAVIGATION.labels(action)
+    for status in ("ok", "unauthorized", "dropped", "duplicate"):
+        WEBHOOKS.labels(status)
+    for ntype in EMOJI:
+        NOTIFICATIONS.labels(ntype)
 
     homeserver = os.environ["MATRIX_URL"]
     user_id = os.environ["MATRIX_USER_ID"]
@@ -489,14 +752,27 @@ async def main():
     session_ttl = int(os.environ.get("REQUEST_SESSION_TIMEOUT_SECONDS") or 600)
     store = "/data/store"
 
+    # Notifier config (webhook -> notifications). WEBHOOK_SECRET is optional:
+    # without it the webhook endpoint is not registered at all, so the bot can
+    # run as a pure request bot.
+    secret = os.environ.get("WEBHOOK_SECRET") or ""
+    try:
+        user_map = json.loads(os.environ.get("USER_MAP") or "{}")
+    except json.JSONDecodeError as e:
+        log.error("USER_MAP is not valid JSON (%s) — continuing WITHOUT mentions!", e)
+        user_map = {}
+    admin_ids = [x.strip() for x in (os.environ.get("ADMIN_IDS") or "").split(",") if x.strip()]
+    jellyseerr_url = os.environ.get("JELLYSEERR_URL") or ""
+
     os.makedirs(store, exist_ok=True)
     client = AsyncClient(homeserver, user_id, device_id=device_id, store_path=store)
     client.access_token = os.environ["MATRIX_TOKEN"]
     client.user_id = user_id
     client.load_store()
     log.info(
-        "Starting as %s / device %s / trigger %r / session ttl %ss",
+        "Starting as %s / device %s / trigger %r / session ttl %ss / webhook %s",
         user_id, client.device_id, trigger_prefix, session_ttl,
+        "enabled" if secret else "disabled",
     )
 
     async def on_invite(room: MatrixRoom, event: InviteMemberEvent):
@@ -695,6 +971,72 @@ async def main():
 
     client.add_event_callback(on_reaction, ReactionEvent)
 
+    # --- Notifier: webhook handling ----------------------------------------
+    # Only active when WEBHOOK_SECRET is set. Uses the same `reply`/`send` path
+    # as the request side, so notifications and search results share one lock.
+    pending: dict = {}  # issue_id -> (payload, flush task) buffered for the merge window
+    recent: dict = {}  # (ntype, item) -> expiry; burst dedup, see dedup_seen
+
+    async def deliver(payload: dict):
+        out = render(payload, user_map, admin_ids, jellyseerr_url)
+        ntype = payload["notification_type"]
+        poster_url = (payload.get("image") or None) if ntype not in ISSUE_FOLLOWUPS else None
+        log.info("Sending %s (image=%s)", ntype, poster_url)
+        async with lock:
+            await send(client, room_id, *out, poster_url=poster_url)
+        NOTIFICATIONS.labels(ntype).inc()
+
+    async def webhook(req: web.Request) -> web.Response:
+        if not hmac.compare_digest(req.headers.get("Authorization", ""), secret):
+            log.warning("Webhook with wrong/missing secret from %s", req.remote)
+            WEBHOOKS.labels("unauthorized").inc()
+            return web.Response(status=401, text="unauthorized")
+        try:
+            payload = await req.json()
+        except json.JSONDecodeError:
+            WEBHOOKS.labels("dropped").inc()
+            return web.Response(status=400, text="bad json")
+
+        ntype = payload.get("notification_type") or ""
+        if ntype not in EMOJI:
+            log.info("Dropping type %r", ntype)
+            WEBHOOKS.labels("dropped").inc()
+            return web.Response(text="ignored")
+        WEBHOOKS.labels("ok").inc()
+
+        if dedup_seen(recent, ntype, payload, time.monotonic()):
+            log.info("Duplicate %s for %r within %ds — dropping",
+                      ntype, payload.get("subject"), DEDUP_TTL)
+            WEBHOOKS.labels("duplicate").inc()
+            return web.Response(text="duplicate")
+
+        issue_id = (payload.get("issue") or {}).get("issue_id")
+        if ntype in ISSUE_FOLLOWUPS and issue_id:
+            buffered = pending.pop(issue_id, None)
+            if buffered:
+                other, task = buffered
+                task.cancel()
+                if (ntype == "ISSUE_COMMENT") != (other["notification_type"] == "ISSUE_COMMENT"):
+                    status_p, comment_p = (other, payload) if ntype == "ISSUE_COMMENT" else (payload, other)
+                    merged = dict(status_p)
+                    merged["comment"] = comment_p.get("comment") or {}
+                    log.info("Merging %s + %s for issue %s", ntype, other["notification_type"], issue_id)
+                    await deliver(merged)
+                    return web.Response(text="ok")
+                await deliver(other)
+
+            async def flush():
+                await asyncio.sleep(MERGE_WINDOW)
+                p, _ = pending.pop(issue_id, (None, None))
+                if p:
+                    await deliver(p)
+
+            pending[issue_id] = (payload, asyncio.create_task(flush()))
+            return web.Response(text="buffered")
+
+        await deliver(payload)
+        return web.Response(text="ok")
+
     async def metrics(_req: web.Request) -> web.Response:
         return web.Response(body=generate_latest(), headers={"Content-Type": CONTENT_TYPE_LATEST})
 
@@ -704,10 +1046,15 @@ async def main():
     app = web.Application()
     app.router.add_get("/metrics", metrics)
     app.router.add_get("/healthz", healthz)
+    if secret:
+        app.router.add_post("/webhook", webhook)
     runner = web.AppRunner(app)
     await runner.setup()
     await web.TCPSite(runner, "0.0.0.0", 8080).start()
-    log.info("Metrics on :8080/metrics, health on :8080/healthz")
+    log.info(
+        "Metrics on :8080/metrics, health on :8080/healthz%s",
+        ", webhook on :8080/webhook" if secret else " (no webhook - WEBHOOK_SECRET unset)",
+    )
 
     await client.sync_forever(timeout=30000)
 
@@ -776,6 +1123,50 @@ def selfcheck():
     set_lang("en")
     assert STRINGS["en"].keys() == STRINGS["de"].keys()
     assert STRINGS["en"]["media_type"].keys() == STRINGS["de"]["media_type"].keys()
+    assert STRINGS["en"]["events"].keys() == STRINGS["de"]["events"].keys()
+    assert STRINGS["en"]["media_types"].keys() == STRINGS["de"]["media_types"].keys()
+    assert STRINGS["en"]["status"].keys() == STRINGS["de"]["status"].keys()
+    assert STRINGS["en"]["issue_types"].keys() == STRINGS["de"]["issue_types"].keys()
+    assert STRINGS["en"]["issue_status"].keys() == STRINGS["de"]["issue_status"].keys()
+
+    # Notifier render(): unknown type dropped, known type rendered with pings.
+    umap = {"frodo": "@frodo:example.org"}
+    team = ["@gandalf:example.org"]
+    assert render({"notification_type": "MEDIA_FAILED"}, umap) is None
+    body, fmt, m = render(
+        {
+            "notification_type": "MEDIA_AVAILABLE",
+            "subject": "The Lord of the Rings (2001)",
+            "message": "One ring to rule them all...",
+            "media": {"media_type": "movie", "status": "AVAILABLE"},
+            "request": {"requestedBy_username": "frodo"},
+        },
+        umap,
+    )
+    assert "The Lord of the Rings (2001) (Movie)" in body and "Requested by: frodo" in body, body
+    assert '<a href="https://matrix.to/#/@frodo:example.org">frodo</a>' in fmt, fmt
+    assert m == ["@frodo:example.org"], m
+
+    # New request: the team is pinged, the requester themselves is not.
+    pending = {
+        "notification_type": "MEDIA_PENDING",
+        "subject": "The Lord of the Rings",
+        "media": {"media_type": "tv"},
+        "request": {"requestedBy_username": "frodo"},
+    }
+    body, fmt, m = render(pending, umap, team)
+    assert m == team, m
+    assert "cc: @gandalf:example.org" in body, body
+
+    # dedup_seen: same (type, item) within TTL is a duplicate, then expires.
+    recent: dict = {}
+    assert dedup_seen(recent, "MEDIA_AVAILABLE", {"media": {"tmdbId": 1}}, 1000.0) is False
+    assert dedup_seen(recent, "MEDIA_AVAILABLE", {"media": {"tmdbId": 1}}, 1001.0) is True
+    assert dedup_seen(recent, "MEDIA_AVAILABLE", {"media": {"tmdbId": 2}}, 1002.0) is False
+    assert dedup_seen(recent, "MEDIA_AVAILABLE", {"media": {"tmdbId": 1}}, 2000.0) is False  # expired
+    # Non-deduped types are never dropped.
+    assert dedup_seen(recent, "ISSUE_COMMENT", {"issue": {"issue_id": 7}}, 1000.0) is False
+    assert dedup_seen(recent, "ISSUE_COMMENT", {"issue": {"issue_id": 7}}, 1001.0) is False
 
     # Error counter, same pattern as jellyseerr-matrix-bot/bot.py.
     logging.getLogger().addHandler(ErrorCounter(level=logging.ERROR))

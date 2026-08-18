@@ -1,10 +1,14 @@
 # jellyseerr-matrix-request-bot
 
-Search and request movies/TV shows in a Matrix room by typing a sentence.
-Companion to [jellyseerr-matrix-bot](../jellyseerr-matrix-bot), which handles
-the other direction (Jellyseerr webhook -> Matrix notification). This one
-listens instead of only sending: `!request The Matrix` posts a result with
-poster + caption, and you navigate/request with emoji reactions.
+Search and request movies/TV shows in a Matrix room by typing a sentence, and
+get Jellyseerr webhook notifications in the same room. This is a single bot
+that combines both directions:
+
+- **Request side** (like [teleseerr](../teleseerr)): `!request The Matrix`
+  posts a result with poster + caption, and you navigate/request with emoji
+  reactions.
+- **Notifier side** (like the old `jellyseerr-matrix-bot`): a `/webhook`
+  endpoint turns Jellyseerr notifications into Matrix messages.
 
 Modeled on [teleseerr](../teleseerr) (the Telegram version of this same idea):
 search goes straight to the Jellyseerr API (no LLM), results are shown one at a
@@ -12,22 +16,21 @@ time with a poster and caption, and you can page through them. Since Matrix has
 no Telegram-style inline buttons, navigation uses reactions on the bot's own
 message: **◀️** previous, **➕** request, **➡️** next.
 
-## Why a separate bot from jellyseerr-matrix-bot?
+## Why one bot instead of two?
 
-jellyseerr-matrix-bot is deliberately dependency-light (nio + aiohttp +
-prometheus, no LLM) and outbound-only. This bot adds a second Jellyseerr API
-surface (search + request, not just webhooks) and inbound message handling with
-its own failure modes. Keeping it a separate process means the notifier's
-reliability and cost profile are unaffected, and each bot stays a single file
-you can read start to finish.
+The old setup split this into `jellyseerr-matrix-bot` (webhook notifier) and
+this request bot. Both share the same E2EE send path, the same room and the
+same Matrix account setup, so running them as one process removes the duplicate
+crypto store, the second container and the webhook-routing confusion (a webhook
+sent to the wrong bot). The notifier side is optional: leave `WEBHOOK_SECRET`
+empty and the bot runs as a pure request bot.
 
 ## Requirements
 
-- A Matrix account **distinct from** jellyseerr-matrix-bot's (own device, own
-  crypto store - see [jellyseerr-matrix-bot/docs/setup.md](../jellyseerr-matrix-bot/docs/setup.md)
+- A Matrix account (own device, own crypto store - see
+  [jellyseerr-matrix-bot/docs/setup.md](../jellyseerr-matrix-bot/docs/setup.md)
   for the token-generation steps, same procedure here).
-- Invite the bot into the same room as the notifications (or a different one -
-  your call), it joins on its own.
+- Invite the bot into the room, it joins on its own.
 - A Jellyseerr API key (Settings -> General).
 
 Fill in `config.env` from `config.env.example` - see that file for every
@@ -77,6 +80,18 @@ docker compose up -d --build
 
 Uses `uv` (see `pyproject.toml`/`uv.lock`). Run `uv lock` after changing
 dependencies, then rebuild.
+
+## Webhook notifications (optional)
+
+To also receive Jellyseerr notifications in the room, set `WEBHOOK_SECRET` in
+`config.env` and point Jellyseerr's webhook at the bot:
+
+- URL: `http://<host>:8082/webhook` (the port exposed in `docker-compose.yml`)
+- Authorization header: your `WEBHOOK_SECRET` value
+
+Optionally set `USER_MAP` (Jellyseerr username -> Matrix ID, to ping the
+affected user) and `ADMIN_IDS` (comma-separated team Matrix IDs, pinged on new
+requests/issues). Leave `WEBHOOK_SECRET` empty to run as a pure request bot.
 
 ## Contributing
 

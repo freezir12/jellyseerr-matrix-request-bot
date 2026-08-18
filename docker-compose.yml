@@ -11,11 +11,8 @@ services:
       MATRIX_ROOM_ID: ${MATRIX_ROOM_ID}
       JELLYSEERR_API_URL: ${JELLYSEERR_API_URL}
       JELLYSEERR_API_KEY: ${JELLYSEERR_API_KEY}
-      JELLYSEERR_URL: ${JELLYSEERR_URL}
-      OPENAI_API_KEY: ${OPENAI_API_KEY}
-      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4.1-nano}
       REQUEST_TRIGGER_PREFIX: ${REQUEST_TRIGGER_PREFIX:-!request}
-      REQUEST_CONFIRM_TIMEOUT_SECONDS: ${REQUEST_CONFIRM_TIMEOUT_SECONDS:-300}
+      REQUEST_SESSION_TIMEOUT_SECONDS: ${REQUEST_SESSION_TIMEOUT_SECONDS:-600}
       BOT_LANG: ${BOT_LANG:-en}
     volumes:
       # The crypto store MUST persist, otherwise the bot shows up as a new
@@ -27,7 +24,7 @@ services:
       timeout: 5s
       retries: 3
     # The bot listens on container port 8080 (/metrics and /healthz only - it
-    # has no inbound webhook, all traffic to Jellyseerr/OpenAI is outbound).
+    # has no inbound webhook, all traffic to Jellyseerr is outbound).
     # ports:
     #   - "8080:8080"
 

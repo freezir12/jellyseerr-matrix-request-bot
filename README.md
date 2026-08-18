@@ -3,25 +3,23 @@
 Search and request movies/TV shows in a Matrix room by typing a sentence.
 Companion to [jellyseerr-matrix-bot](../jellyseerr-matrix-bot), which handles
 the other direction (Jellyseerr webhook -> Matrix notification). This one
-listens instead of only sending: `!request The Matrix` gets you a result and,
-if it's not available yet, a plain-text confirmation ("reply 1" / "reply
-yes") to fire the actual request - Matrix has no Telegram-style inline
-buttons to build a real one on.
+listens instead of only sending: `!request The Matrix` posts a result with
+poster + caption, and you navigate/request with emoji reactions.
 
-Ported from [teleseerr-py](../teleseerr-py) (the Telegram version of this same
-idea): a LangGraph/OpenAI agent parses the free-text request (title, year,
-season numbers), searches Jellyseerr, and reports status or offers to
-request.
+Modeled on [teleseerr](../teleseerr) (the Telegram version of this same idea):
+search goes straight to the Jellyseerr API (no LLM), results are shown one at a
+time with a poster and caption, and you can page through them. Since Matrix has
+no Telegram-style inline buttons, navigation uses reactions on the bot's own
+message: **◀️** previous, **➕** request, **➡️** next.
 
 ## Why a separate bot from jellyseerr-matrix-bot?
 
 jellyseerr-matrix-bot is deliberately dependency-light (nio + aiohttp +
-prometheus, no LLM) and outbound-only. This bot adds an LLM agent, a second
-Jellyseerr API surface (search + request, not just webhooks), and inbound
-message handling with its own failure modes (OpenAI down/rate-limited).
-Keeping it a separate process means the notifier's reliability and cost
-profile are unaffected, and each bot stays a single file you can read start to
-finish.
+prometheus, no LLM) and outbound-only. This bot adds a second Jellyseerr API
+surface (search + request, not just webhooks) and inbound message handling with
+its own failure modes. Keeping it a separate process means the notifier's
+reliability and cost profile are unaffected, and each bot stays a single file
+you can read start to finish.
 
 ## Requirements
 
@@ -31,7 +29,6 @@ finish.
 - Invite the bot into the same room as the notifications (or a different one -
   your call), it joins on its own.
 - A Jellyseerr API key (Settings -> General).
-- An OpenAI API key.
 
 Fill in `config.env` from `config.env.example` - see that file for every
 variable and its default.
@@ -42,26 +39,35 @@ In the room:
 
 ```
 !request The Matrix
-!request Stranger Things season 4
-!request The Office s02 and s05
-!request Dune 2021
+!request Stranger Things
+!request Dune
 ```
 
-The bot searches Jellyseerr, reports availability/request status, and - if
-the item isn't requested yet - posts a numbered list and asks for
-confirmation:
+The bot searches Jellyseerr and posts the first result with its poster and a
+caption (title, overview, release date, type, request status), plus the
+reactions **◀️ ➕ ➡️**:
 
 ```
-Found:
-1. Dune (2021) — Not requested
-Reply with the number to request it, or 'no' to cancel. (Expires in 5 min.)
+Dune
+
+A mythic and emotionally charged hero's journey...
+
+release date: 2021-10-22
+
+Movie — Not requested
+
+1/3 · React with ◀️ / ➕ / ➡️ to navigate or request.
 ```
 
-Reply `1` (or `yes`, if there's only one candidate) to request it, `no` /
-`cancel` to back out. The confirmation expires on its own
-(`REQUEST_CONFIRM_TIMEOUT_SECONDS`, default 5 min) so a stale "yes" days later
-can't fire against the wrong title. State is tracked per person, not per room,
-so several people can search at the same time without cross-talk.
+- **➡️** shows the next result (loading more pages automatically when you reach
+  the end, like teleseerr's pagination).
+- **◀️** goes back to the previous result.
+- **➕** requests the currently shown item (TV shows request all seasons by
+  default, exactly like teleseerr).
+
+The search session expires on its own (`REQUEST_SESSION_TIMEOUT_SECONDS`,
+default 10 min) so a stale reaction days later can't fire against the wrong
+title.
 
 ## Deployment
 
@@ -69,13 +75,13 @@ so several people can search at the same time without cross-talk.
 docker compose up -d --build
 ```
 
-Uses `uv` (see `pyproject.toml`/`uv.lock`), same as teleseerr-py. Run
-`uv lock` after changing dependencies, then rebuild.
+Uses `uv` (see `pyproject.toml`/`uv.lock`). Run `uv lock` after changing
+dependencies, then rebuild.
 
 ## Contributing
 
 Run `python bot.py --selfcheck` before pushing (no network required - it
-covers the parsing/state-machine logic, not the live Jellyseerr/OpenAI calls).
+covers the parsing/state-machine logic, not the live Jellyseerr calls).
 Keep commits in conventional style (`feat: ...`, `fix: ...`), English please.
 
 MIT licensed.

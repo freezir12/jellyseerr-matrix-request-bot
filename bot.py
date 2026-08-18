@@ -667,7 +667,11 @@ async def main():
             session.index += 1
 
         session_set(sessions, target_event_id, session, now, session_ttl)
+        # Editing the result message (poster upload + m.replace) is a network
+        # round trip too, so show the typing indicator while it runs.
+        await set_typing(True)
         await show_result(session, target_event_id=target_event_id)
+        await set_typing(False)
         NAVIGATION.labels(action).inc()
 
     async def on_message(room: MatrixRoom, event: RoomMessageText):

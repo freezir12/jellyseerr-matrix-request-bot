@@ -564,6 +564,15 @@ async def main():
         async with lock:  # ponytail: one room, one sender - a global lock is enough
             return await send(client, room_id, body, formatted or html.escape(body), [], poster_url=poster_url)
 
+    async def set_typing(typing: bool):
+        """Show/hide the bot's typing indicator in the room. This is Matrix's
+        equivalent of Telegram's 'typing...' - clients render it as an animated
+        indicator next to the bot's name while it is working."""
+        try:
+            await client.room_typing(room_id, typing_state=typing, timeout=30000)
+        except Exception:
+            log.debug("Could not set typing state to %s", typing)
+
     async def show_result(session: Session, target_event_id: str | None = None):
         """Render the current result and either send a new message (with
         reactions) or edit the existing one. Returns the event_id of the
@@ -584,13 +593,16 @@ async def main():
         if not query:
             await reply(S["usage"])
             return
+        await set_typing(True)
         try:
             results = await search_jellyseerr(query, page=1)
         except Exception:
             log.exception("Jellyseerr search failed")
             REQUESTS.labels("error").inc()
+            await set_typing(False)
             await reply(S["error"])
             return
+        await set_typing(False)
 
         if not results:
             await reply(S["no_results"].format(query=query))
@@ -619,11 +631,13 @@ async def main():
         if action == "request":
             session_pop(sessions, target_event_id, now)
             result = session.results[session.index]
+            await set_typing(True)
             try:
                 message = await request_jellyseerr(result["media_id"], result["media_type"])
             except Exception:
                 log.exception("Request to Jellyseerr failed")
                 message = S["request_failed"]
+            await set_typing(False)
             await reply(message, html.escape(message))
             NAVIGATION.labels("request").inc()
             return
@@ -638,11 +652,13 @@ async def main():
             if session.index >= len(session.results) - 1:
                 # Pagination: fetch the next page and append, like teleseerr.
                 session.page += 1
+                await set_typing(True)
                 try:
                     more = await search_jellyseerr(session.query, page=session.page)
                 except Exception:
                     log.exception("Jellyseerr pagination search failed")
                     more = []
+                await set_typing(False)
                 if not more:
                     await reply(S["no_more_next"])
                     NAVIGATION.labels("next").inc()

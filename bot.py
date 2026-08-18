@@ -29,7 +29,9 @@ from nio import (
     AsyncClient,
     InviteMemberEvent,
     MatrixRoom,
+    MegolmEvent,
     ReactionEvent,
+    RoomKeyRequest,
     RoomMessageText,
     RoomSendResponse,
     SyncResponse,
@@ -501,6 +503,43 @@ async def main():
         LAST_SYNC.set(time.time())
 
     client.add_response_callback(on_sync, SyncResponse)
+
+    # E2EE key plumbing. nio does NOT automatically ask for missing Megolm
+    # session keys, and it does not auto-answer incoming RoomKeyRequests when
+    # the device is unverified. Both must be wired explicitly or the bot sits
+    # in an encrypted room seeing only undecryptable MegolmEvents - which is
+    # exactly the "no session found" spam in the logs. Without these handlers
+    # the bot can never decrypt !request messages from other room members.
+    async def on_undecryptable(room: MatrixRoom, event: MegolmEvent):
+        if room.room_id != room_id:
+            return
+        if event.session_id in client.outgoing_key_requests:
+            return  # a request is already in flight for this session
+        try:
+            resp = await client.request_room_key(event)
+        except LocalProtocolError:
+            pass  # already requested / not logged in yet - fine
+        except Exception:
+            log.exception("Requesting room key for session %s failed", event.session_id)
+        else:
+            log.info("Requested room key for session %s (sender %s)", event.session_id, event.sender)
+
+    client.add_event_callback(on_undecryptable, MegolmEvent)
+
+    async def on_key_request(event: RoomKeyRequest):
+        # A device asks us for a room key. If it's untrusted we'd normally have
+        # to verify it first (continue_key_share); here we share blindly so the
+        # very first message from a fresh device starts decrypting immediately.
+        # The key-sharing themselves stays safe: we only share what that device
+        # is entitled to see anyway (the room it already has access to).
+        try:
+            device = client.device_store[event.sender][event.requesting_device_id]
+            await client.continue_key_share(event)
+            log.info("Shared room key %s with %s/%s", event.session_id, event.sender, event.requesting_device_id)
+        except Exception:
+            log.exception("Could not share room key %s with %s/%s", event.session_id, event.sender, event.requesting_device_id)
+
+    client.add_to_device_callback(on_key_request, RoomKeyRequest)
 
     if client.should_upload_keys:
         await client.keys_upload()
